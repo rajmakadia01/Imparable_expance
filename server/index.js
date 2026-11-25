@@ -1,0 +1,37 @@
+import express from 'express';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const file=path.join(root,'data','entries.json');
+const app=express(); app.use(express.json({limit:'5mb'}));
+const validDate=s=>{if(typeof s!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(s))return false;const d=new Date(s+'T00:00:00Z');return !isNaN(d)&&d.toISOString().slice(0,10)===s};
+const valid=r=>r&&validDate(r.date)&&['cash','upi','bank','expense','cash_hand'].includes(r.type)&&typeof r.amount==='number'&&Number.isFinite(r.amount)&&r.amount>0&&r.amount<=1000000000000&&typeof r.description==='string'&&r.description.length<=120&&(r.deductFromCash===undefined||typeof r.deductFromCash==='boolean');
+async function read(){try{const data=JSON.parse(await fs.readFile(file,'utf8'));if(!Array.isArray(data))throw Error('Invalid data');return data}catch(e){if(e.code==='ENOENT')return [];throw e}}
+let queue=Promise.resolve();
+function mutate(fn){const work=queue.then(async()=>{const data=await read();const result=fn(data);if(result.error)return result;await fs.mkdir(path.dirname(file),{recursive:true});const tmp=file+'.tmp';await fs.writeFile(tmp,JSON.stringify(data,null,2),'utf8');await fs.rename(tmp,file);return result});queue=work.catch(()=>{});return work}
+import { scrypt as scryptCallback, timingSafeEqual, randomBytes } from 'node:crypto';
+import { promisify } from 'node:util';
+const scrypt=promisify(scryptCallback);
+const usersFile=path.join(root,'data','users.json');
+const sessions=new Map();
+const cookieOptions='HttpOnly; SameSite=Strict; Path=/; Max-Age=43200';
+async function getUsers(){try{return JSON.parse(await fs.readFile(usersFile,'utf8'))}catch(e){if(e.code==='ENOENT')return null;throw e}}
+function getSession(req){const token=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('session='))?.slice(8);const session=sessions.get(token);if(!session||session.expires<Date.now()){if(token)sessions.delete(token);return null}return session}
+function login(res,username){const token=randomBytes(32).toString('hex');sessions.set(token,{username,expires:Date.now()+12*60*60*1000});res.setHeader('Set-Cookie',`session=${token}; ${cookieOptions}`);res.json({username})}
+app.get('/api/auth/status',async(req,res,next)=>{try{const users=await getUsers();const session=getSession(req);res.json({setupRequired:!users,username:session?.username||null})}catch(e){next(e)}});
+let setupInProgress=false;
+app.post('/api/auth/setup',async(req,res,next)=>{try{if(setupInProgress||await getUsers())return res.status(403).json({error:'Setup is already complete.'});setupInProgress=true;try{const users=req.body?.users;if(!Array.isArray(users)||users.length!==3||users.some(u=>typeof u.username!=='string'||!/^[a-zA-Z0-9_.@-]{3,30}$/.test(u.username)||typeof u.password!=='string'||u.password.length<8||u.password.length>128)||new Set(users.map(u=>u.username.toLowerCase())).size!==3)return res.status(400).json({error:'Use three unique usernames (3–30 characters; letters, numbers, @, ., _ or -) and passwords of at least 8 characters.'});const stored=[];for(const u of users){const salt=randomBytes(16).toString('hex');const hash=(await scrypt(u.password,salt,64)).toString('hex');stored.push({username:u.username,salt,hash})}await fs.mkdir(path.dirname(usersFile),{recursive:true});await fs.writeFile(usersFile,JSON.stringify(stored,null,2),{flag:'wx'});login(res,stored[0].username)}finally{setupInProgress=false}}catch(e){next(e)}});
+const attempts=new Map();
+app.post('/api/auth/login',async(req,res,next)=>{try{const ip=req.ip;const attempt=attempts.get(ip);if(attempt&&attempt.until>Date.now()&&attempt.count>=10)return res.status(429).json({error:'Too many attempts. Try again in 15 minutes.'});const users=await getUsers();const user=users?.find(u=>u.username.toLowerCase()===String(req.body?.username||'').toLowerCase());const password=typeof req.body?.password==='string'?req.body.password:'';if(!user||password.length>128||!timingSafeEqual(Buffer.from(user.hash,'hex'),await scrypt(password,user.salt,64))){const current=attempt&&attempt.until>Date.now()?attempt:{count:0,until:Date.now()+15*60*1000};current.count++;attempts.set(ip,current);return res.status(401).json({error:'Incorrect username or password.'})}attempts.delete(ip);login(res,user.username)}catch(e){next(e)}});
+app.post('/api/auth/logout',(req,res)=>{const token=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('session='))?.slice(8);if(token)sessions.delete(token);res.setHeader('Set-Cookie','session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');res.json({ok:true})});
+app.use('/api',(req,res,next)=>{if(!getSession(req))return res.status(401).json({error:'Please sign in to continue.'});next()});
+
+app.get('/api/entries',async(req,res,next)=>{try{await queue;res.json(await read())}catch(e){next(e)}});
+app.post('/api/entries',async(req,res,next)=>{try{if(!valid(req.body))return res.status(400).json({error:'Invalid entry'});const entry={id:randomUUID(),date:req.body.date,type:req.body.type,amount:req.body.amount,description:req.body.description.trim(),...(req.body.type==='bank'?{deductFromCash:req.body.deductFromCash!==false}:{})};await mutate(data=>{data.push(entry);return {}});res.status(201).json(entry)}catch(e){next(e)}});
+app.put('/api/entries/:id',async(req,res,next)=>{try{if(!valid(req.body))return res.status(400).json({error:'Invalid entry'});const result=await mutate(data=>{const i=data.findIndex(x=>x.id===req.params.id);if(i<0)return {error:'Entry not found'};data[i]={id:req.params.id,date:req.body.date,type:req.body.type,amount:req.body.amount,description:req.body.description.trim(),...(req.body.type==='bank'?{deductFromCash:req.body.deductFromCash!==false}:{})};return {entry:data[i]}});if(result.error)return res.status(404).json(result);res.json(result.entry)}catch(e){next(e)}});
+app.delete('/api/entries/:id',async(req,res,next)=>{try{const result=await mutate(data=>{const i=data.findIndex(x=>x.id===req.params.id);if(i<0)return {error:'Entry not found'};data.splice(i,1);return {}});if(result.error)return res.status(404).json(result);res.status(204).end()}catch(e){next(e)}});
+app.post('/api/restore',async(req,res,next)=>{try{const entries=req.body?.records;if(req.body?.version!==1||!Array.isArray(entries)||!entries.every(x=>valid(x)&&typeof x.id==='string'&&x.id.length>0&&x.id.length<=100)||new Set(entries.map(x=>x.id)).size!==entries.length)return res.status(400).json({error:'Invalid backup file'});await mutate(data=>{data.splice(0,data.length,...entries.map(x=>({id:x.id,date:x.date,type:x.type,amount:x.amount,description:x.description.trim(),...(x.type==='bank'?{deductFromCash:x.deductFromCash!==false}:{})})));return {}});res.json({ok:true})}catch(e){next(e)}});
+app.use(express.static(path.join(root,'dist')));app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Could not read or save data.'});});
+const port=Number(process.env.PORT)||3001;app.listen(port,'127.0.0.1',()=>console.log(`Imparable: http://127.0.0.1:${port}`));
