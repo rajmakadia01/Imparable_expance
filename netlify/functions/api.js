@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import serverless from 'serverless-http';
 import pg from 'pg';
 import { randomBytes, randomUUID, createHash, scrypt as rawScrypt, timingSafeEqual } from 'node:crypto';

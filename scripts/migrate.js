@@ -1,4 +1,4 @@
-﻿import fs from 'node:fs/promises';
+import fs from 'node:fs/promises';
 import readline from 'node:readline/promises';
 import pg from 'pg';
 const rl=readline.createInterface({input:process.stdin,output:process.stderr,terminal:false});
